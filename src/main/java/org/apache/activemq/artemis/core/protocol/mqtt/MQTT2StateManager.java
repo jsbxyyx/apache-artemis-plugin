@@ -1,0 +1,261 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.activemq.artemis.core.protocol.mqtt;
+
+import io.netty.handler.codec.mqtt.MqttTopicSubscription;
+import org.apache.activemq.artemis.api.core.ActiveMQBuffer;
+import org.apache.activemq.artemis.api.core.Message;
+import org.apache.activemq.artemis.api.core.Pair;
+import org.apache.activemq.artemis.api.core.QueueConfiguration;
+import org.apache.activemq.artemis.api.core.RoutingType;
+import org.apache.activemq.artemis.core.filter.impl.FilterImpl;
+import org.apache.activemq.artemis.core.message.impl.CoreMessage;
+import org.apache.activemq.artemis.core.server.ActiveMQServer;
+import org.apache.activemq.artemis.core.server.MessageReference;
+import org.apache.activemq.artemis.core.server.Queue;
+import org.apache.activemq.artemis.core.transaction.Transaction;
+import org.apache.activemq.artemis.core.transaction.TransactionOperationAbstract;
+import org.apache.activemq.artemis.core.transaction.impl.TransactionImpl;
+import org.apache.activemq.artemis.utils.collections.LinkedListIterator;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.lang.invoke.MethodHandles;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
+public class MQTT2StateManager {
+
+   private static final Logger logger = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
+   private ActiveMQServer server;
+   private final Map<String, MQTT2SessionState> sessionStates = new ConcurrentHashMap<>();
+   private final Queue sessionStore;
+   private static Map<Integer, MQTT2StateManager> INSTANCES = new HashMap<>();
+   private final Map<String, MQTT2Connection> connectedClients  = new ConcurrentHashMap<>();
+   private final long timeout;
+
+   /*
+    * Even though there may be multiple instances of MQTTProtocolManager (e.g. for MQTT on different ports) we only want
+    * one instance of MQTTSessionStateManager per-broker with the understanding that there can be multiple brokers in
+    * the same JVM.
+    */
+   public static synchronized MQTT2StateManager getInstance(ActiveMQServer server) throws Exception {
+      MQTT2StateManager instance = INSTANCES.get(System.identityHashCode(server));
+      if (instance == null) {
+         instance = new MQTT2StateManager(server);
+         INSTANCES.put(System.identityHashCode(server), instance);
+      }
+
+      return instance;
+   }
+
+   public static synchronized void removeInstance(ActiveMQServer server) {
+      INSTANCES.remove(System.identityHashCode(server));
+   }
+
+   private MQTT2StateManager(ActiveMQServer server) throws Exception {
+      this.server = server;
+      this.timeout = server.getConfiguration().getMqttSessionStatePersistenceTimeout();
+      this.sessionStore = server.createQueue(QueueConfiguration.of(MQTT2Util.MQTT_SESSION_STORE).setRoutingType(RoutingType.ANYCAST).setLastValue(true).setDurable(true).setInternal(true).setAutoCreateAddress(true), true);
+
+      // load session data from queue
+      try (LinkedListIterator<MessageReference> iterator = sessionStore.browserIterator()) {
+         while (iterator.hasNext()) {
+            Message message = iterator.next().getMessage();
+            if (!(message instanceof CoreMessage)) {
+               MQTT2Logger.LOGGER.sessionStateMessageIncorrectType(message.getClass().getName().toString());
+               continue;
+            }
+            String clientId = message.getStringProperty(Message.HDR_LAST_VALUE_NAME);
+            if (clientId == null || clientId.length() == 0) {
+               MQTT2Logger.LOGGER.sessionStateMessageBadClientId();
+               continue;
+            }
+            MQTT2SessionState sessionState;
+            try {
+               sessionState = new MQTT2SessionState((CoreMessage) message);
+            } catch (Exception e) {
+               MQTT2Logger.LOGGER.errorDeserializingStateMessage(e);
+               continue;
+            }
+            sessionStates.put(clientId, sessionState);
+         }
+      } catch (NoSuchElementException ignored) {
+         // this could happen through paging browsing
+      }
+   }
+
+   public void scanSessions() {
+      List<String> toRemove = new ArrayList();
+      for (Map.Entry<String, MQTT2SessionState> entry : sessionStates.entrySet()) {
+         MQTT2SessionState state = entry.getValue();
+         logger.debug("Inspecting session: {}", state);
+         int sessionExpiryInterval = state.getClientSessionExpiryInterval();
+         if (!state.isAttached() && sessionExpiryInterval > 0 && state.getDisconnectedTime() + (sessionExpiryInterval * 1000) < System.currentTimeMillis()) {
+            toRemove.add(entry.getKey());
+         }
+         if (state.isWill() && !state.isAttached() && state.isFailed() && state.getWillDelayInterval() > 0 && state.getDisconnectedTime() + (state.getWillDelayInterval() * 1000) < System.currentTimeMillis()) {
+            state.getSession().sendWillMessage();
+         }
+      }
+
+      for (String key : toRemove) {
+         try {
+            MQTT2SessionState state = removeSessionState(key);
+            if (state != null) {
+               if (state.isWill() && !state.isAttached() && state.isFailed()) {
+                  state.getSession().sendWillMessage();
+               }
+               state.getSession().clean(false);
+            }
+         } catch (Exception e) {
+            MQTT2Logger.LOGGER.failedToRemoveSessionState(key, e);
+         }
+      }
+   }
+
+   public MQTT2SessionState getSessionState(String clientId) throws Exception {
+      /* [MQTT-3.1.2-4] Attach an existing session if one exists otherwise create a new one. */
+      if (sessionStates.containsKey(clientId)) {
+         return sessionStates.get(clientId);
+      } else {
+         MQTT2SessionState sessionState = new MQTT2SessionState(clientId);
+         logger.debug("Adding MQTT session state for: {}", clientId);
+         sessionStates.put(clientId, sessionState);
+         return sessionState;
+      }
+   }
+
+   public MQTT2SessionState removeSessionState(String clientId) throws Exception {
+      logger.debug("Removing MQTT session state for: {}", clientId);
+      if (clientId == null) {
+         return null;
+      }
+      removeDurableSessionState(clientId);
+      return sessionStates.remove(clientId);
+   }
+
+   public void removeDurableSessionState(String clientId) throws Exception {
+      int deletedCount = sessionStore.deleteMatchingReferences(FilterImpl.createFilter(new StringBuilder(Message.HDR_LAST_VALUE_NAME).append(" = '").append(clientId).append("'").toString()));
+      logger.debug("Removed {} durable MQTT state records for: {}", deletedCount, clientId);
+   }
+
+   public Map<String, MQTT2SessionState> getSessionStates() {
+      return new HashMap<>(sessionStates);
+   }
+
+   @Override
+   public String toString() {
+      return "MQTTSessionStateManager@" + Integer.toHexString(System.identityHashCode(this));
+   }
+
+   public void storeSessionState(MQTT2SessionState state) throws Exception {
+      logger.debug("Adding durable MQTT state record for: {}", state.getClientId());
+
+      /*
+       * It is imperative to ensure the routed message is actually *all the way* on the queue before proceeding
+       * otherwise there can be a race with removing it.
+       */
+      CountDownLatch latch = new CountDownLatch(1);
+      Transaction tx = new TransactionImpl(server.getStorageManager());
+      server.getPostOffice().route(serializeState(state, server.getStorageManager().generateID()), tx, false);
+      tx.addOperation(new TransactionOperationAbstract() {
+         @Override
+         public void afterCommit(Transaction tx) {
+            latch.countDown();
+         }
+      });
+      tx.commit();
+      if (!latch.await(timeout, TimeUnit.MILLISECONDS)) {
+         throw MQTTBundle.BUNDLE.unableToStoreMqttState(timeout);
+      }
+   }
+
+   public static CoreMessage serializeState(MQTT2SessionState state, long messageID) {
+      CoreMessage message = new CoreMessage().initBuffer(50).setMessageID(messageID);
+      message.setAddress(MQTT2Util.MQTT_SESSION_STORE);
+      message.setDurable(true);
+      message.putStringProperty(Message.HDR_LAST_VALUE_NAME, state.getClientId());
+      Collection<Pair<MqttTopicSubscription, Integer>> subscriptions = state.getSubscriptionsPlusID();
+      ActiveMQBuffer buf = message.getBodyBuffer();
+
+      /*
+       * This byte represents the "version". If the payload changes at any point in the future then we can detect that
+       * and adjust so that when users are upgrading we can still read the old data format.
+       */
+      buf.writeByte((byte) 0);
+
+      buf.writeInt(subscriptions.size());
+      logger.debug("Serializing {} subscriptions", subscriptions.size());
+      for (Pair<MqttTopicSubscription, Integer> pair : subscriptions) {
+         MqttTopicSubscription sub = pair.getA();
+         buf.writeString(sub.topicName());
+         buf.writeInt(sub.option().qos().value());
+         buf.writeBoolean(sub.option().isNoLocal());
+         buf.writeBoolean(sub.option().isRetainAsPublished());
+         buf.writeInt(sub.option().retainHandling().value());
+         buf.writeNullableInt(pair.getB());
+      }
+
+      return message;
+   }
+
+   public boolean isClientConnected(String clientId, MQTT2Connection connection) {
+      MQTT2Connection connectedConn = connectedClients.get(clientId);
+
+      if (connectedConn != null) {
+         return connectedConn.equals(connection);
+      }
+
+      return false;
+   }
+
+   public boolean isClientConnected(String clientId) {
+      return connectedClients.containsKey(clientId);
+   }
+
+   public void removeConnectedClient(String clientId) {
+      connectedClients.remove(clientId);
+   }
+
+   /**
+    * @param clientId
+    * @param connection
+    * @return the {@code MQTTConnection} that the added connection replaced or null if there was no previous entry for
+    * the {@code clientId}
+    */
+   public MQTT2Connection addConnectedClient(String clientId, MQTT2Connection connection) {
+      return connectedClients.put(clientId, connection);
+   }
+
+   public MQTT2Connection getConnectedClient(String clientId) {
+      return connectedClients.get(clientId);
+   }
+
+   /** For DEBUG only */
+   public Map<String, MQTT2Connection> getConnectedClients() {
+      return connectedClients;
+   }
+}
